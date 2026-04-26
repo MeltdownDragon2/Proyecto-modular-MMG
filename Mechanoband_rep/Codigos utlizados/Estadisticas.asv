@@ -1,0 +1,615 @@
+% ========================================================================
+% MECANOMIOGRAFÍA — ANÁLISIS ESTADÍSTICO GRUPAL
+% MechanoBand: 15 sujetos × 9 movimientos × 4 sensores × 6 métricas
+%
+% ESTRUCTURA DE CARPETAS REAL:
+%   raiz/
+%     DD-MM-NOMBRE APELLIDO/
+%       NOMBRE_ANTEBRAZO_MOVIMIENTO1_1/
+%           NOMBRE_ANTEBRAZO_MOVIMIENTO1_1.mat   ← mismo nombre que carpeta
+%       NOMBRE_ANTEBRAZO_MOVIMIENTO2_1/
+%           NOMBRE_ANTEBRAZO_MOVIMIENTO2_1.mat
+%       NOMBRE_ANTEBRAZO_MOVIMIENTO3_1/
+%       NOMBRE_BRAZO_MOVIMIENTO1_1/
+%       ...  (9 subcarpetas en total)
+%     DD-MM-NOMBRE2 APELLIDO2/
+%       ...
+%
+% SALIDAS:
+%   - Tablas de media ± DE por parámetro, sensor y movimiento
+%   - ANOVA de una vía por parámetro (movimientos dentro de cada grupo)
+%   - Comparación intermuscular por grupo muscular
+%   - Figuras de barras con error (media ± DE) para tesis
+%   - Archivo Excel con todos los resultados
+% ========================================================================
+clear all; close all;
+clc;
+
+%% ═══════════════════════════════════════════════════════════
+%  CONFIGURACIÓN — EDITAR ESTAS LÍNEAS SEGÚN TUS DATOS
+% ═══════════════════════════════════════════════════════════
+
+% Carpeta raíz donde están todas las carpetas de sujetos
+ruta_raiz = 'C:\Users\Dell\OneDrive\Escritorio\PDFS\Biomedica\8-Octavo semestre\Mechanoband\Base de datos\SUJETOS';
+
+% Etiquetas cortas para los 3 movimientos de cada grupo
+% Movimiento 1, 2 y 3 en el mismo orden que los realizaste
+etiq_antebrazo   = {'Flex/Ext',        'Prensión carga', 'Sostenido'};
+etiq_brazo       = {'Rotación muñeca',  'Flex/Ext codo',  'Sostenido'};
+etiq_pantorrilla = {'Flex/Ext tobillo', 'Puntas carga',   'Sostenido'};
+
+% Palabras clave que identifican el grupo muscular en el nombre de carpeta
+% Deben coincidir EXACTAMENTE con lo que aparece en el nombre (mayúsculas)
+clave_antebrazo   = 'ANTEBRAZO';
+clave_brazo       = 'BRAZO';
+clave_pantorrilla = 'PANTORRILLA';
+
+% Nombres de los sensores según colocación
+nombres_sensores = {'Sensor 1','Sensor 2','Sensor 3','Sensor 4'};
+
+% Métricas — deben coincidir con los campos de datos.pm en tu .mat
+nombres_metricas = {'RMS','MPF','MDF','FreqDom','Entropia','RatioBandas'};
+
+% Nivel de significancia para ANOVA
+alpha = 0.05;
+
+% ── No editar a partir de aquí ─────────────────────────────
+grupos = {
+    'Antebrazo',   clave_antebrazo,   etiq_antebrazo;
+    'Brazo',       clave_brazo,       etiq_brazo;
+    'Pantorrilla', clave_pantorrilla, etiq_pantorrilla;
+};
+
+n_metricas = length(nombres_metricas);
+n_sensores = 4;
+n_grupos   = size(grupos, 1);
+n_movs     = 3;
+
+carpeta_salida = fullfile(ruta_raiz, 'Analisis_Grupal_2');
+if ~exist(carpeta_salida,'dir'), mkdir(carpeta_salida); end
+
+fprintf('\n╔══════════════════════════════════════════════════════╗\n');
+fprintf('║   ANÁLISIS ESTADÍSTICO GRUPAL — MechanoBand         ║\n');
+fprintf('╚══════════════════════════════════════════════════════╝\n\n');
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 1: DETECTAR CARPETAS DE SUJETOS
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Detectando carpetas de sujetos en:\n   %s\n\n', ruta_raiz);
+
+contenido    = dir(ruta_raiz);
+carpetas_suj = {};
+for k = 1:length(contenido)
+    if contenido(k).isdir && ...
+       ~startsWith(contenido(k).name, '.') && ...
+       ~strcmp(contenido(k).name, 'Analisis_Grupal')
+        carpetas_suj{end+1} = contenido(k).name;
+    end
+end
+n_sujetos = length(carpetas_suj);
+fprintf('   Sujetos encontrados: %d\n\n', n_sujetos);
+
+if n_sujetos == 0
+    error('No se encontraron carpetas de sujetos.\nVerifica la variable ruta_raiz.');
+end
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 2: CARGAR DATOS
+%
+%  Lógica de búsqueda del archivo .mat:
+%  Para cada sujeto → para cada grupo → para movimiento 1,2,3:
+%    1. Listar subcarpetas de la carpeta del sujeto
+%    2. Filtrar las que contengan la clave del grupo (ej: 'ANTEBRAZO')
+%    3. Ordenarlas por el número de MOVIMIENTO (1, 2 o 3)
+%    4. Tomar la subcarpeta número m
+%    5. El archivo .mat tiene el mismo nombre que esa subcarpeta
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Cargando datos...\n\n');
+
+% datos_num(grupo, movimiento, metrica, sensor, sujeto)
+datos_num = NaN(n_grupos, n_movs, n_metricas, n_sensores, n_sujetos);
+log_carga = {};
+
+for suj = 1:n_sujetos
+    ruta_suj = fullfile(ruta_raiz, carpetas_suj{suj});
+
+    % Listar todas las subcarpetas de este sujeto de una vez
+    contenido_suj = dir(ruta_suj);
+    subcarpetas   = {contenido_suj([contenido_suj.isdir]).name};
+    subcarpetas   = subcarpetas(~startsWith(subcarpetas, '.'));
+
+    for g = 1:n_grupos
+        clave_grupo = grupos{g, 2};   % ej: 'ANTEBRAZO'
+
+        % Filtrar subcarpetas que corresponden a este grupo muscular.
+        % FIX: usar patrón con delimitador _ para que 'BRAZO' no coincida
+        % dentro de 'ANTEBRAZO'. Los nombres tienen forma NOMBRE_GRUPO_...
+        % por lo que el grupo siempre está entre guiones bajos.
+        patron_rx = ['_' upper(clave_grupo) '_'];
+        mask_grupo = ~cellfun(@isempty, strfind(upper(subcarpetas), patron_rx));
+        % Fallback para el primer segmento si el nombre empieza con la clave
+        if ~any(mask_grupo)
+            mask_grupo = startsWith(upper(subcarpetas), [upper(clave_grupo) '_']);
+        end
+        subs_grupo = subcarpetas(mask_grupo);
+
+        if isempty(subs_grupo)
+            log_carga{end+1} = sprintf('SIN CARPETAS: Suj=%s | Grupo=%s', ...
+                carpetas_suj{suj}, grupos{g,1});
+            continue;
+        end
+
+        % Ordenar por número de MOVIMIENTO extraído del nombre
+        % Patrón esperado: NOMBRE_GRUPO_MOVIMIENTOx_y → extraer x
+        nums_mov = zeros(1, length(subs_grupo));
+        for k = 1:length(subs_grupo)
+            tok = regexp(subs_grupo{k}, 'MOVIMIENTO(\d+)', 'tokens', 'ignorecase');
+            if ~isempty(tok)
+                nums_mov(k) = str2double(tok{1}{1});
+            end
+        end
+        [nums_mov_ord, idx_ord] = sort(nums_mov);
+        subs_grupo_ord = subs_grupo(idx_ord);
+
+        for m = 1:n_movs
+            % Buscar la subcarpeta con número de movimiento = m
+            idx_mov = find(nums_mov_ord == m, 1);
+
+            if isempty(idx_mov)
+                log_carga{end+1} = sprintf('MOVIMIENTO %d NO ENCONTRADO: Suj=%s | Grupo=%s', ...
+                    m, carpetas_suj{suj}, grupos{g,1});
+                continue;
+            end
+
+            nombre_subcarpeta = subs_grupo_ord{idx_mov};
+            ruta_mov          = fullfile(ruta_suj, nombre_subcarpeta);
+
+            % El archivo .mat tiene el mismo nombre que la subcarpeta
+            ruta_archivo = fullfile(ruta_mov, [nombre_subcarpeta '.mat']);
+
+            if ~isfile(ruta_archivo)
+                % Intentar buscar cualquier .mat dentro de la carpeta
+                mats = dir(fullfile(ruta_mov, '*.mat'));
+                if ~isempty(mats)
+                    ruta_archivo = fullfile(ruta_mov, mats(1).name);
+                else
+                    log_carga{end+1} = sprintf('ARCHIVO FALTANTE: %s', ruta_archivo);
+                    continue;
+                end
+            end
+
+            % Cargar y extraer métricas
+            try
+                d = load(ruta_archivo, 'datos');
+                d = d.datos;
+
+                for sn = 1:n_sensores
+                    for met = 1:n_metricas
+                        campo = nombres_metricas{met};
+                        if isfield(d,'pm') && length(d.pm) >= sn && ...
+                           isfield(d.pm(sn), campo)
+                            val = d.pm(sn).(campo);
+                            if isnumeric(val) && isscalar(val) && ~isnan(val)
+                                datos_num(g, m, met, sn, suj) = val;
+                            end
+                        end
+                    end
+                end
+
+            catch ME
+                log_carga{end+1} = sprintf('ERROR al cargar: %s → %s', ...
+                    ruta_archivo, ME.message);
+            end
+        end
+    end
+
+    fprintf('   Sujeto %2d/%d: %s\n', suj, n_sujetos, carpetas_suj{suj});
+end
+
+% Reporte de advertencias
+if ~isempty(log_carga)
+    fprintf('\n⚠  Advertencias durante la carga (%d):\n', length(log_carga));
+    for k = 1:length(log_carga)
+        fprintf('   %s\n', log_carga{k});
+    end
+end
+fprintf('\n▶ Carga completada.\n\n');
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 3: ESTADÍSTICA DESCRIPTIVA
+%  media y DE por grupo × movimiento × métrica × sensor
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Calculando estadísticos descriptivos...\n');
+
+% [n_grupos, n_movs, n_metricas, n_sensores]
+media_grupo = squeeze(mean(datos_num, 5, 'omitnan'));
+de_grupo    = squeeze(std(datos_num,  0, 5, 'omitnan'));
+n_validos   = squeeze(sum(~isnan(datos_num), 5));
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 4: ANOVA DE UNA VÍA
+%  Factor: tipo de movimiento (3 niveles) dentro de cada grupo muscular
+%  Variable dependiente: cada métrica × sensor
+%  Resultado: tabla p-values [n_grupos × n_metricas × n_sensores]
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Calculando ANOVA de una vía...\n');
+
+p_anova = NaN(n_grupos, n_metricas, n_sensores);
+
+for g = 1:n_grupos
+    for met = 1:n_metricas
+        for sn = 1:n_sensores
+            % Extraer datos de los 3 movimientos: [n_sujetos x 3]
+            Y = squeeze(datos_num(g, :, met, sn, :))';  % [n_sujetos x n_movs]
+
+            % Eliminar sujetos con NaN en cualquier movimiento
+            filas_completas = all(~isnan(Y), 2);
+            Y_limpio = Y(filas_completas, :);
+
+            if size(Y_limpio, 1) < 3
+                % No hay suficientes datos para ANOVA
+                continue;
+            end
+
+            % ANOVA de una vía con grupos como columnas
+            grupos_anova = [];
+            datos_anova  = [];
+            for mov = 1:n_movs
+                datos_anova  = [datos_anova;  Y_limpio(:, mov)];
+                grupos_anova = [grupos_anova; mov * ones(size(Y_limpio, 1), 1)];
+            end
+
+            try
+                p_anova(g, met, sn) = anova1(datos_anova, grupos_anova, 'off');
+            catch
+                % anova1 puede fallar si todos los valores son iguales
+            end
+        end
+    end
+end
+
+fprintf('▶ ANOVA completado.\n\n');
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 5: IMPRIMIR TABLAS EN CONSOLA
+% ═══════════════════════════════════════════════════════════
+for g = 1:n_grupos
+    nombre_g    = grupos{g,1};
+    etiq_movs   = grupos{g,3};
+
+    fprintf('╔══════════════════════════════════════════════════════════════════════════╗\n');
+    fprintf('║   %s — Media ± DE (n=%d sujetos)%-35s║\n', nombre_g, n_sujetos, '');
+    fprintf('╠══════════════════════════════════════════════════════════════════════════╣\n');
+
+    for met = 1:n_metricas
+        fprintf('║  %s\n', nombres_metricas{met});
+        fprintf('║  %-10s  %-20s  %-20s  %-20s  p-ANOVA\n', ...
+            'Sensor', etiq_movs{1}, etiq_movs{2}, etiq_movs{3});
+        fprintf('║  %s\n', repmat('-',1,80));
+
+        for sn = 1:n_sensores
+            vals_media = squeeze(media_grupo(g, :, met, sn));
+            vals_de    = squeeze(de_grupo(g,    :, met, sn));
+            p_val      = p_anova(g, met, sn);
+
+            if ~isnan(p_val) && p_val < alpha
+                sig = ' (*)';
+            else
+                sig = '    ';
+            end
+
+            fprintf('║  %-10s  %6.4f±%6.4f      %6.4f±%6.4f      %6.4f±%6.4f    p=%.4f%s\n', ...
+                nombres_sensores{sn}, ...
+                vals_media(1), vals_de(1), ...
+                vals_media(2), vals_de(2), ...
+                vals_media(3), vals_de(3), ...
+                p_val, sig);
+        end
+        fprintf('║\n');
+    end
+    fprintf('╚══════════════════════════════════════════════════════════════════════════╝\n\n');
+end
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 6: FIGURAS — BARRAS CON ERROR (media ± DE)
+%  Una figura por grupo muscular × métrica
+%  4 grupos de barras (sensores) × 3 barras (movimientos)
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Generando figuras...\n');
+
+colores_mov = [0.2 0.4 0.8; 0.8 0.3 0.1; 0.1 0.65 0.3];
+unidades    = {'g','Hz','Hz','Hz','bits','ratio'};
+
+for g = 1:n_grupos
+    nombre_g  = grupos{g,1};
+    etiq_movs = grupos{g,3};
+
+    fig_bar = figure('Position',[100 80 1800 1000], ...
+        'Name', sprintf('Barras_%s', nombre_g));
+    sgtitle(sprintf('%s — Media ± DE por Métrica y Sensor (n=%d)', nombre_g, n_sujetos), ...
+        'FontSize',13,'FontWeight','bold');
+
+    for met = 1:n_metricas
+        ax = subplot(2, 3, met);
+
+        % Datos: [n_movs × n_sensores]
+        Y_media = squeeze(media_grupo(g, :, met, :));   % [n_movs x n_sensores]
+        Y_de    = squeeze(de_grupo(g,    :, met, :));
+
+        % Gráfica de barras agrupadas
+        hb = bar(1:n_sensores, Y_media', 'grouped');
+        for mov = 1:n_movs
+            hb(mov).FaceColor = colores_mov(mov,:);
+            hb(mov).FaceAlpha = 0.85;
+            hb(mov).DisplayName = etiq_movs{mov};
+        end
+
+        hold on;
+        % Barras de error
+        n_grupos_bar = n_sensores;
+        n_barras     = n_movs;
+        ancho_grupo  = 0.8;
+        ancho_barra  = ancho_grupo / n_barras;
+        for mov = 1:n_movs
+            offsets = linspace(-ancho_grupo/2 + ancho_barra/2, ...
+                                ancho_grupo/2 - ancho_barra/2, n_barras);
+            x_err = (1:n_sensores) + offsets(mov);
+            errorbar(x_err, Y_media(mov,:), Y_de(mov,:), ...
+                'k', 'LineStyle','none', 'LineWidth',1.2, ...
+                'HandleVisibility','off');
+        end
+        hold off;
+
+        % Asteriscos de significancia dentro de la figura
+        % Se expande el ylim para que el asterisco quede visible sin salirse
+        y_max = max(Y_media(:) + Y_de(:), [], 'omitnan');
+        if isnan(y_max) || y_max == 0, y_max = 1; end
+        margen  = y_max * 0.20;          % 20% de margen superior
+        y_texto = y_max + margen * 0.4;  % posición del asterisco
+        ylim(ax, [0, y_max + margen]);   % expandir eje Y
+
+        p_val = p_anova(g, met, :);      % [1 x 1 x n_sensores]
+        for sn = 1:n_sensores
+            pv = p_val(1,1,sn);
+            if ~isnan(pv) && pv < alpha
+                text(sn, y_texto, '*', ...
+                    'HorizontalAlignment','center', ...
+                    'FontSize',16,'FontWeight','bold','Color',[0.8 0 0]);
+            end
+        end
+
+        grid on; box on;
+        set(ax,'XTick',1:n_sensores,'XTickLabel',nombres_sensores,'FontSize',9);
+        ylabel(sprintf('%s (%s)', nombres_metricas{met}, unidades{met}),'FontSize',9);
+        title(nombres_metricas{met},'FontSize',10,'FontWeight','bold');
+        if met == 1
+            legend(etiq_movs, 'Location','northoutside', ...
+                'Orientation','horizontal', 'FontSize',9, ...
+                'Box','off');
+        end
+    end
+
+    % Guardar figura
+    saveas(fig_bar, fullfile(carpeta_salida, sprintf('Barras_%s.fig', nombre_g)));
+    exportgraphics(fig_bar, fullfile(carpeta_salida, ...
+        sprintf('Barras_%s.png', nombre_g)), 'Resolution', 200);
+end
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 7: FIGURA COMPARACIÓN INTERMUSCULAR
+%  Radar/heatmap de parámetros normalizados por sensor
+%  promediados sobre sujetos y movimientos del mismo tipo
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Generando figura de comparación intermuscular...\n');
+
+for g = 1:n_grupos
+    nombre_g = grupos{g,1};
+
+    % Promedio sobre los 3 movimientos: [n_metricas x n_sensores]
+    media_inter = squeeze(mean(media_grupo(g,:,:,:), 2));  % [n_metricas x n_sensores]
+
+    % Normalizar por métrica (0–1) para heatmap comparativo
+    tabla_norm = zeros(size(media_inter));
+    for met = 1:n_metricas
+        fila = media_inter(met,:);
+        rng  = max(fila) - min(fila);
+        if rng > 0
+            tabla_norm(met,:) = (fila - min(fila)) / rng;
+        else
+            tabla_norm(met,:) = 0.5 * ones(1, n_sensores);
+        end
+    end
+
+    fig_hm = figure('Position',[200 100 800 500], ...
+        'Name', sprintf('Heatmap_%s', nombre_g));
+    sgtitle(sprintf('%s — Caracterización Intermuscular (promedio normalizado)', nombre_g), ...
+        'FontSize',12,'FontWeight','bold');
+
+    imagesc(tabla_norm);
+    colormap(hot); colorbar;
+    set(gca,'XTick',1:n_sensores,'XTickLabel',nombres_sensores,'FontSize',10);
+    set(gca,'YTick',1:n_metricas,'YTickLabel',nombres_metricas,'FontSize',10);
+    xlabel('Sensor / Músculo'); ylabel('Parámetro');
+
+    % Valores numéricos reales dentro de cada celda
+    % Color del texto adaptativo: blanco sobre celdas oscuras, negro sobre claras
+    for met = 1:n_metricas
+        for sn = 1:n_sensores
+            val_norm = tabla_norm(met, sn);
+            % umbral 0.55: por encima el fondo es claro -> texto negro
+            if val_norm > 0.55
+                color_texto = [0 0 0];
+            else
+                color_texto = [1 1 1];
+            end
+            val_real = media_inter(met, sn);
+            if isnan(val_real)
+                str_val = 'N/A';
+            else
+                str_val = sprintf('%.3f', val_real);
+            end
+            text(sn, met, str_val, ...
+                'HorizontalAlignment','center','FontSize',8, ...
+                'Color', color_texto, 'FontWeight','bold');
+        end
+    end
+
+    saveas(fig_hm, fullfile(carpeta_salida, sprintf('Heatmap_%s.fig', nombre_g)));
+    exportgraphics(fig_hm, fullfile(carpeta_salida, ...
+        sprintf('Heatmap_%s.png', nombre_g)), 'Resolution', 200);
+end
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 8: FIGURA SUJETO REPRESENTATIVO
+%  El sujeto cuya distancia euclídea a la mediana grupal
+%  sea mínima → mejor candidato para figuras de ejemplo en tesis
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Identificando sujeto representativo...\n');
+
+% Usar todos los valores disponibles para calcular distancia a la mediana
+mediana_global = squeeze(median(datos_num, 5, 'omitnan'));  % [g,m,met,sn]
+distancias     = zeros(n_sujetos, 1);
+
+for suj = 1:n_sujetos
+    datos_suj = datos_num(:,:,:,:,suj);              % [g,m,met,sn]
+    diff_suj  = datos_suj - mediana_global;
+    diff_suj(isnan(diff_suj)) = 0;
+    distancias(suj) = norm(diff_suj(:));
+end
+
+[~, idx_rep] = min(distancias);
+fprintf('\n   ★ Sujeto representativo: %s (dist. mediana = %.4f)\n', ...
+    carpetas_suj{idx_rep}, distancias(idx_rep));
+fprintf('   → Usa sus figuras .fig como ejemplo en la tesis.\n\n');
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 9: EXPORTAR A EXCEL
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Exportando resultados a Excel...\n');
+
+ruta_excel = fullfile(carpeta_salida, 'Resultados_MechanoBand.xlsx');
+
+% Una hoja por grupo muscular
+for g = 1:n_grupos
+    nombre_g  = grupos{g,1};
+    etiq_movs = grupos{g,3};
+
+    % Encabezados — declarar dentro del bucle para evitar acumulacion
+    cabecera = {'Metrica','Sensor'};
+    for m = 1:n_movs
+        cabecera{end+1} = sprintf('%s_Media', strrep(etiq_movs{m},' ','_'));
+        cabecera{end+1} = sprintf('%s_DE',    strrep(etiq_movs{m},' ','_'));
+    end
+    cabecera{end+1} = 'p_ANOVA';
+    cabecera{end+1} = 'Significativo';
+
+    % Datos
+    filas = {};
+    for met = 1:n_metricas
+        for sn = 1:n_sensores
+            fila = {nombres_metricas{met}, nombres_sensores{sn}};
+            for m = 1:n_movs
+                fila{end+1} = media_grupo(g,m,met,sn);
+                fila{end+1} = de_grupo(g,m,met,sn);
+            end
+            pv = p_anova(g,met,sn);
+            fila{end+1} = pv;
+            if ~isnan(pv) && pv < alpha
+                fila{end+1} = 'Sí (*)';
+            else
+                fila{end+1} = 'No';
+            end
+            filas{end+1} = fila;
+        end
+    end
+
+    % Escribir en Excel
+    % Convertir cell array de filas a matriz para evitar error de cell2table
+    n_filas_excel = length(filas);
+    n_cols_excel  = length(cabecera);
+    mat_excel = cell(n_filas_excel, n_cols_excel);
+    for fi = 1:n_filas_excel
+        fila_i = filas{fi};
+        for ci = 1:min(length(fila_i), n_cols_excel)
+            mat_excel{fi, ci} = fila_i{ci};
+        end
+    end
+    T = cell2table(mat_excel, 'VariableNames', cabecera);
+    writetable(T, ruta_excel, 'Sheet', nombre_g, 'WriteRowNames', false);
+end
+
+% Hoja adicional: datos crudos por sujeto (RMS eje Z como referencia)
+cabecera_raw = {'Sujeto','Grupo','Movimiento'};
+for sn = 1:n_sensores
+    for met = 1:n_metricas
+        cabecera_raw{end+1} = sprintf('S%d_%s', sn, nombres_metricas{met});
+    end
+end
+
+filas_raw = {};
+for suj = 1:n_sujetos
+    for g = 1:n_grupos
+        etiq_movs = grupos{g,3};
+        for m = 1:n_movs
+            fila = {carpetas_suj{suj}, grupos{g,1}, etiq_movs{m}};
+            for sn = 1:n_sensores
+                for met = 1:n_metricas
+                    fila{end+1} = datos_num(g,m,met,sn,suj);
+                end
+            end
+            filas_raw{end+1} = fila;
+        end
+    end
+end
+
+T_raw = cell2table(filas_raw, 'VariableNames', cabecera_raw);
+writetable(T_raw, ruta_excel, 'Sheet', 'Datos_Crudos');
+
+fprintf('   Excel guardado: %s\n\n', ruta_excel);
+
+%% ═══════════════════════════════════════════════════════════
+%  PASO 10: GUARDAR RESULTADOS EN .MAT
+% ═══════════════════════════════════════════════════════════
+fprintf('▶ Guardando resultados en .mat...\n');
+
+resultados.datos_num        = datos_num;
+resultados.media_grupo      = media_grupo;
+resultados.de_grupo         = de_grupo;
+resultados.n_validos        = n_validos;
+resultados.p_anova          = p_anova;
+resultados.sujeto_rep       = carpetas_suj{idx_rep};
+resultados.idx_sujeto_rep   = idx_rep;
+resultados.carpetas_sujetos = carpetas_suj;
+resultados.grupos           = grupos;
+resultados.nombres_metricas = nombres_metricas;
+resultados.nombres_sensores = nombres_sensores;
+resultados.alpha            = alpha;
+resultados.log_carga        = log_carga;
+
+save(fullfile(carpeta_salida,'Resultados_Grupales.mat'), 'resultados');
+
+%% ═══════════════════════════════════════════════════════════
+%  RESUMEN FINAL EN CONSOLA
+% ═══════════════════════════════════════════════════════════
+fprintf('╔══════════════════════════════════════════════════════╗\n');
+fprintf('║   ANÁLISIS GRUPAL COMPLETADO                        ║\n');
+fprintf('╠══════════════════════════════════════════════════════╣\n');
+fprintf('║   Sujetos analizados : %d\n', n_sujetos);
+fprintf('║   Grupos musculares  : %d\n', n_grupos);
+fprintf('║   Movimientos/grupo  : %d\n', n_movs);
+fprintf('║   Métricas           : %d\n', n_metricas);
+fprintf('║   Sujeto rep.        : %s\n', carpetas_suj{idx_rep});
+fprintf('╠══════════════════════════════════════════════════════╣\n');
+fprintf('║   Salidas generadas:\n');
+fprintf('║     Barras_[Grupo].fig/png × %d\n', n_grupos);
+fprintf('║     Heatmap_[Grupo].fig/png × %d\n', n_grupos);
+fprintf('║     Resultados_MechanoBand.xlsx\n');
+fprintf('║     Resultados_Grupales.mat\n');
+fprintf('║   Carpeta: %s\n', carpeta_salida);
+fprintf('╚══════════════════════════════════════════════════════╝\n\n');
+
+% Advertencia si hubo archivos faltantes
+if ~isempty(log_carga)
+    fprintf('⚠  Hubo %d advertencia(s) durante la carga.\n', length(log_carga));
+    fprintf('   Revisa la variable resultados.log_carga o el log de consola.\n\n');
+end
